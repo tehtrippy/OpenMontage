@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 # Vertical social delivery target. Mirrors the adapter's defaults on purpose —
 # see tools/video/openrouter_video.py. 2K is opt-in, never implicit.
-DEFAULT_RESOLUTION = "1080x1920"
+#
+# "1080p" is the provider's tier enum, and at 9:16 it IS 1080x1920 — the
+# delivery frame stays the same, only the wire format changed. The old
+# "1080x1920" here was rejected by every submit with a 400 ZodError.
+DEFAULT_RESOLUTION = "1080p"
 DEFAULT_ASPECT_RATIO = "9:16"
 DEFAULT_ACT_SECONDS = 5
 DEFAULT_MODEL = "google/veo-3.1-lite"
@@ -49,6 +53,20 @@ class CausalAct:
     negative_prompt: str = ""
     duration_seconds: int = DEFAULT_ACT_SECONDS
     carries_identity_from: Optional[str] = None  # previous act id, for the record
+    # Identity anchors for entities the handoff frame cannot carry. Chaining
+    # transports only what is VISIBLE in the previous act's final frame: on
+    # 2026-09-21 the muddler head was submerged in pulp at both handoffs, so
+    # three acts invented three different tools (toothed crown -> flat puck ->
+    # perforated barrel) while glass, board, hands and camera held perfectly.
+    # Paths/URLs here are sent as input_references. Tuple, not list, because
+    # CausalAct is frozen and a mutable default would be shared across acts.
+    reference_images: tuple[str, ...] = ()
+    # Optional closing-frame pin. The chain sets first_frame automatically; this
+    # one is always explicit, because the frame an act should END on is a
+    # production decision, not something the chain can derive. None means the
+    # act is free at its close, which is the existing behaviour for every
+    # caller written before this field existed.
+    last_frame: Optional[str] = None
 
 
 @dataclass
@@ -150,6 +168,21 @@ def build_chain_payloads(
         }
         if act.negative_prompt:
             payload["negative_prompt"] = act.negative_prompt
+        if act.reference_images:
+            payload["input_references"] = list(act.reference_images)
+        if act.last_frame:
+            # last_frame turns the act into an interpolation between two known
+            # states on every model tested so far, so it needs a first frame.
+            # Refuse at plan time rather than mid-run: the chain supplies one to
+            # every act but the first, and the first has nothing to chain from.
+            if not (chain and i > 0):
+                raise ValueError(
+                    f"act {act.id!r} sets last_frame but has no first_frame "
+                    "(it is the chain seed, or chaining is off). last_frame is an "
+                    "interpolation endpoint, not a standalone identity pin - supply both "
+                    "frames or neither."
+                )
+            payload["last_frame"] = act.last_frame
 
         first_frame_source = None
         if chain and i > 0:
@@ -164,6 +197,86 @@ def build_chain_payloads(
             first_frame_source=first_frame_source,
         ))
     return steps
+
+
+def identity_mechanisms(model: str, model_capabilities: Optional[dict[str, Any]] = None
+                        ) -> dict[str, bool]:
+    """Which identity mechanisms are usable for this model, so a planner can choose.
+
+    Model-agnostic by construction: nothing here knows a model name. Pass
+    ``model_capabilities`` from the provider listing (for OpenRouter,
+    ``OpenRouterVideo.fetch_model_capabilities(model)`` - metadata only, never
+    billed) and the answer follows the listing. With no listing, only what the
+    adapter reports about itself is used, and anything unadvertised is False,
+    because "not advertised" must not read as "available".
+
+    ``input_references`` is False unless a capability listing positively
+    declares reference support. As of 2026-09-21 the OpenRouter video listing
+    has no reference field at all, so this is False for every model there -
+    which is the point: prompt constraints and handoff visibility carry identity
+    until a provider says otherwise.
+    """
+    caps = model_capabilities or {}
+    frames = tuple(caps.get("supported_frame_images") or ())
+    reference_keys = ("supported_input_references", "supported_reference_images",
+                      "input_references", "reference_images")
+    supports_references = any(bool(caps.get(k)) for k in reference_keys)
+
+    if not caps:
+        # No listing: fall back to the adapter contract, which describes the
+        # request schema, not any one model.
+        from tools.video.openrouter_video import OpenRouterVideo
+
+        supported = OpenRouterVideo.supports
+        return {
+            "prompt_constraints": True,
+            "first_frame": bool(supported.get("image_to_video")),
+            "last_frame": False,          # unknown per model; never assumed
+            "input_references": False,    # never assumed - must be declared
+            "interpolation_pair": False,
+        }
+
+    return {
+        "prompt_constraints": True,
+        "first_frame": "first_frame" in frames,
+        "last_frame": "last_frame" in frames,
+        "input_references": supports_references,
+        # Both endpoints available means an interpolation job is expressible.
+        # It is a distinct operation, not an identity mechanism.
+        "interpolation_pair": "first_frame" in frames and "last_frame" in frames,
+    }
+
+
+def attach_entity_references(
+    act: CausalAct,
+    entity_bible: dict[str, Any],
+    entity_ids: Iterable[str],
+) -> CausalAct:
+    """Return a copy of act carrying the bible's reference images for those entities.
+
+    The entity bible already declares reference_images per entity
+    (schemas/artifacts/entity_bible.schema.json) and nothing consumed it. This
+    is that wiring: cite the entities an act must keep identical, and their
+    anchors ride along with the prompt.
+
+    Existing references are kept and bible ones appended, de-duplicated with
+    order preserved, so calling it twice is a no-op rather than a doubling.
+    An unknown entity_id raises — silently generating without the anchor is the
+    failure this exists to prevent.
+    """
+    by_id = {e["entity_id"]: e for e in entity_bible.get("entities", [])}
+    refs: list[str] = list(act.reference_images)
+    for entity_id in entity_ids:
+        entity = by_id.get(entity_id)
+        if entity is None:
+            raise KeyError(
+                f"entity {entity_id!r} is not in the entity bible; "
+                f"known ids: {sorted(by_id)}"
+            )
+        for ref in entity.get("reference_images", []):
+            if ref not in refs:
+                refs.append(ref)
+    return replace(act, reference_images=tuple(refs))
 
 
 def estimate_chain_cost(acts: list[CausalAct], model: str = DEFAULT_MODEL) -> float:

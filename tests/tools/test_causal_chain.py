@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from lib.causal_chain import (
+    attach_entity_references,
+    identity_mechanisms,
     DEFAULT_ACT_SECONDS,
     DEFAULT_ASPECT_RATIO,
     DEFAULT_RESOLUTION,
@@ -46,8 +48,10 @@ class FakeResult:
 
 class TestGenerationDefaults:
     def test_adapter_default_target_is_1080x1920(self):
+        """1080p + 9:16 IS 1080x1920. The provider takes the tier, not the size —
+        see TestResolutionIsSentAsAProviderTier in test_openrouter_video.py."""
         p = OpenRouterVideo()._build_payload({"prompt": "x"})
-        assert p["resolution"] == "1080x1920"
+        assert p["resolution"] == "1080p"
         assert p["aspect_ratio"] == "9:16"
 
     def test_adapter_default_act_is_five_seconds(self):
@@ -62,7 +66,196 @@ class TestGenerationDefaults:
         assert OpenRouterVideo()._build_payload({"prompt": "x"})["resolution"] != "2K"
 
     def test_chain_defaults_match_the_adapter(self):
-        assert (DEFAULT_RESOLUTION, DEFAULT_ASPECT_RATIO, DEFAULT_ACT_SECONDS) == ("1080x1920", "9:16", 5)
+        assert (DEFAULT_RESOLUTION, DEFAULT_ASPECT_RATIO, DEFAULT_ACT_SECONDS) == ("1080p", "9:16", 5)
+
+    def test_chain_default_resolution_is_a_provider_tier(self):
+        """The chain plans the payload the adapter sends; a pixel size 400s."""
+        assert DEFAULT_RESOLUTION in {"360p", "480p", "720p", "768p", "1080p", "1K", "2K", "4K"}
+        assert OpenRouterVideo()._build_payload(
+            {"prompt": "x", "resolution": DEFAULT_RESOLUTION})["resolution"] == DEFAULT_RESOLUTION
+
+
+class TestIdentityMechanismSelection:
+    """Capability-driven, model-agnostic: nothing here knows a model name.
+
+    The rule that matters is the pessimistic one - an unadvertised capability
+    reads as unavailable. Assuming reference support is how three chained acts
+    ended up with three different tools while everyone believed identity was
+    handled.
+    """
+
+    VEO_LISTING = {
+        "id": "google/veo-3.1-lite",
+        "supported_resolutions": ["720p", "1080p"],
+        "supported_frame_images": ["first_frame", "last_frame"],
+        "generate_audio": True,
+        "seed": True,
+    }
+    FIRST_ONLY_LISTING = {"id": "some/model", "supported_frame_images": ["first_frame"]}
+    NO_FRAMES_LISTING = {"id": "other/model", "supported_frame_images": None}
+
+    def test_listing_drives_the_answer(self):
+        m = identity_mechanisms("google/veo-3.1-lite", self.VEO_LISTING)
+        assert m["first_frame"] is True
+        assert m["last_frame"] is True
+        assert m["interpolation_pair"] is True
+        assert m["prompt_constraints"] is True
+
+    def test_reference_support_is_false_unless_declared(self):
+        """The live listing has no reference field at all, for any model."""
+        assert identity_mechanisms("google/veo-3.1-lite", self.VEO_LISTING)["input_references"] is False
+
+    def test_reference_support_is_honoured_when_a_provider_declares_it(self):
+        listing = {**self.VEO_LISTING, "supported_reference_images": ["identity"]}
+        assert identity_mechanisms("any/model", listing)["input_references"] is True
+
+    def test_first_frame_only_model_has_no_interpolation_pair(self):
+        m = identity_mechanisms("some/model", self.FIRST_ONLY_LISTING)
+        assert m["first_frame"] is True
+        assert m["last_frame"] is False
+        assert m["interpolation_pair"] is False
+
+    def test_model_without_frame_support(self):
+        m = identity_mechanisms("other/model", self.NO_FRAMES_LISTING)
+        assert m["first_frame"] is False and m["last_frame"] is False
+        assert m["prompt_constraints"] is True
+
+    def test_without_a_listing_nothing_unadvertised_is_assumed(self):
+        m = identity_mechanisms("google/veo-3.1-lite")
+        assert m["last_frame"] is False
+        assert m["input_references"] is False
+        assert m["interpolation_pair"] is False
+        assert m["prompt_constraints"] is True
+
+    def test_prompt_constraints_are_always_available(self):
+        for caps in (None, self.VEO_LISTING, self.FIRST_ONLY_LISTING, self.NO_FRAMES_LISTING):
+            assert identity_mechanisms("any/model", caps)["prompt_constraints"] is True
+
+
+class TestEntityIdentityReferences:
+    """Chaining carries only what the handoff frame SHOWS.
+
+    2026-09-21: across A2/A3/A4 the muddler became a toothed crown, then a flat
+    puck, then a perforated barrel, while glass, board, hands, camera and
+    lighting held perfectly. Its head was submerged in pulp in both handoff
+    frames, so the geometry was never in the pixels being handed forward. Fine
+    geometry that is occluded at the handoff needs an explicit anchor.
+    """
+
+    BIBLE = {
+        "version": "1.0",
+        "entities": [
+            {"entity_id": "muddler", "type": "tool",
+             "visual_description": "stainless muddler, toothed crown head",
+             "reference_images": ["refs/muddler.jpg"]},
+            {"entity_id": "working_glass", "type": "container",
+             "visual_description": "faceted pint glass, black silicone base",
+             "reference_images": ["refs/glass.jpg"]},
+            {"entity_id": "board", "type": "work_surface",
+             "visual_description": "walnut end-grain board"},
+        ],
+    }
+
+    def test_default_act_has_no_references(self):
+        assert CausalAct(id="A1", prompt="x").reference_images == ()
+
+    def test_empty_references_emit_no_input_references(self):
+        p = build_chain_payloads([CausalAct(id="A1", prompt="x")], "/tmp/out")[0].payload
+        assert "input_references" not in p
+
+    def test_references_are_propagated_into_the_payload(self):
+        act = CausalAct(id="A1", prompt="x", reference_images=("refs/muddler.jpg",))
+        p = build_chain_payloads([act], "/tmp/out")[0].payload
+        assert p["input_references"] == ["refs/muddler.jpg"]
+
+    def test_references_ride_along_with_chaining(self):
+        """Anchors and first_frame are complementary, not alternatives."""
+        acts = [CausalAct(id="A1", prompt="a"),
+                CausalAct(id="A2", prompt="b", reference_images=("refs/muddler.jpg",))]
+        steps = build_chain_payloads(acts, "/tmp/out")
+        assert steps[1].chained is True
+        assert steps[1].payload["first_frame"].endswith("A1_last.jpg")
+        assert steps[1].payload["input_references"] == ["refs/muddler.jpg"]
+
+    def test_entity_bible_references_attach_to_an_act(self):
+        act = attach_entity_references(CausalAct(id="A2", prompt="x"), self.BIBLE, ["muddler"])
+        assert act.reference_images == ("refs/muddler.jpg",)
+        assert build_chain_payloads([act], "/tmp/out")[0].payload["input_references"] ==             ["refs/muddler.jpg"]
+
+    def test_several_entities_accumulate_in_order(self):
+        act = attach_entity_references(CausalAct(id="A2", prompt="x"), self.BIBLE,
+                                       ["muddler", "working_glass"])
+        assert act.reference_images == ("refs/muddler.jpg", "refs/glass.jpg")
+
+    def test_attaching_twice_does_not_duplicate(self):
+        act = CausalAct(id="A2", prompt="x")
+        once = attach_entity_references(act, self.BIBLE, ["muddler"])
+        twice = attach_entity_references(once, self.BIBLE, ["muddler"])
+        assert twice.reference_images == once.reference_images == ("refs/muddler.jpg",)
+
+    def test_entity_without_reference_images_contributes_nothing(self):
+        act = attach_entity_references(CausalAct(id="A2", prompt="x"), self.BIBLE, ["board"])
+        assert act.reference_images == ()
+
+    def test_unknown_entity_id_raises_rather_than_generating_unanchored(self):
+        with pytest.raises(KeyError, match="muddlerr"):
+            attach_entity_references(CausalAct(id="A2", prompt="x"), self.BIBLE, ["muddlerr"])
+
+    def test_attach_does_not_mutate_the_original_act(self):
+        act = CausalAct(id="A2", prompt="x")
+        attach_entity_references(act, self.BIBLE, ["muddler"])
+        assert act.reference_images == ()
+
+
+class TestLastFrameOnActs:
+    """Closing-frame pins are opt-in and never disturb the chain.
+
+    first_frame is derived by the chain; last_frame is always an explicit
+    production decision, so it is set on the act and nowhere else.
+    """
+
+    def test_default_act_has_no_last_frame(self):
+        assert CausalAct(id="A1", prompt="x").last_frame is None
+
+    def test_absent_last_frame_emits_nothing(self):
+        p = build_chain_payloads([CausalAct(id="A1", prompt="x")], "/tmp/out")[0].payload
+        assert "last_frame" not in p
+
+    def test_last_frame_without_a_first_frame_is_refused_at_plan_time(self):
+        """Confirmed provider behaviour: last_frame is an interpolation endpoint.
+
+        The chain seed has nothing to chain from, so an act that pins only its
+        close would be a provider-invalid job. Caught before the run, not during.
+        """
+        act = CausalAct(id="A1", prompt="x", last_frame="frames/target.jpg")
+        with pytest.raises(ValueError, match="interpolation endpoint"):
+            build_chain_payloads([act], "/tmp/out")
+
+    def test_last_frame_is_refused_when_chaining_is_off(self):
+        acts = [CausalAct(id="A1", prompt="a"),
+                CausalAct(id="A2", prompt="b", last_frame="frames/target.jpg")]
+        with pytest.raises(ValueError, match="interpolation endpoint"):
+            build_chain_payloads(acts, "/tmp/out", chain=False)
+
+    def test_last_frame_coexists_with_chained_first_frame(self):
+        acts = [CausalAct(id="A1", prompt="a"),
+                CausalAct(id="A2", prompt="b", last_frame="frames/target.jpg")]
+        p = build_chain_payloads(acts, "/tmp/out")[1].payload
+        assert p["first_frame"].endswith("A1_last.jpg")
+        assert p["last_frame"] == "frames/target.jpg"
+
+    def test_existing_chain_payloads_are_unchanged(self):
+        """Backward compatibility: an act written before these fields existed."""
+        p = build_chain_payloads([CausalAct(id="A1", prompt="x", negative_prompt="no text")],
+                                 "/tmp/out")[0].payload
+        assert set(p) == {"prompt", "model", "duration", "resolution", "aspect_ratio",
+                          "generate_audio", "output_path", "negative_prompt"}
+
+    def test_positional_construction_still_works(self):
+        """New fields are appended with defaults, so existing positional calls hold."""
+        act = CausalAct("A1", "prompt text", "negatives", 6, "A0")
+        assert (act.duration_seconds, act.carries_identity_from) == (6, "A0")
+        assert act.reference_images == () and act.last_frame is None
 
 
 class TestFrameImagePayloadShape:
@@ -90,9 +283,16 @@ class TestFrameImagePayloadShape:
         assert p["frame_images"][0]["image_url"] == {"url": "https://e/f.jpg"}
 
     def test_last_frame_type_is_preserved(self):
-        p = OpenRouterVideo()._build_payload(
-            {"prompt": "x", "frame_images": [{"frame_type": "last_frame", "image_url": "https://e/f.jpg"}]})
-        assert p["frame_images"][0]["frame_type"] == "last_frame"
+        """Explicit frame_images entries keep their type.
+
+        Paired with a first_frame because veo treats last_frame as an
+        interpolation endpoint and the adapter now refuses it alone.
+        """
+        p = OpenRouterVideo()._build_payload({
+            "prompt": "x",
+            "frame_images": [{"frame_type": "first_frame", "image_url": "https://e/a.jpg"},
+                             {"frame_type": "last_frame", "image_url": "https://e/f.jpg"}]})
+        assert [e["frame_type"] for e in p["frame_images"]] == ["first_frame", "last_frame"]
 
     def test_local_path_becomes_a_data_uri(self):
         """Must be inside the working tree — see the exfiltration guard."""
@@ -147,11 +347,12 @@ class TestChainPlanning:
 
     def test_plan_carries_the_defaults(self):
         p = build_chain_payloads(ACTS, "/tmp/out")[0].payload
-        assert p["resolution"] == "1080x1920" and p["aspect_ratio"] == "9:16"
+        assert p["resolution"] == "1080p" and p["aspect_ratio"] == "9:16"
         assert p["duration"] == 5 and p["generate_audio"] is False
 
     def test_cost_is_knowable_before_spending(self):
-        assert estimate_chain_cost(ACTS, model="google/veo-3.1-lite") == pytest.approx(0.45)
+        """3 acts x 5s at the 1080p audio-off SKU ($0.05/s)."""
+        assert estimate_chain_cost(ACTS, model="google/veo-3.1-lite") == pytest.approx(0.75)
 
 
 class TestChainExecution:

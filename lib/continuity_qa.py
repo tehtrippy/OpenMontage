@@ -142,10 +142,17 @@ def collect_evidence(
     expected_height: int = 1920,
     expected_duration: float = 5.0,
     duration_tolerance: float = 0.35,
+    expect_audio: bool = False,
 ) -> ContinuityReport:
     """Gather what a machine can measure, and stage what only a viewer can judge.
 
     ``act_clips`` is ordered ``[(act_id, mp4_path), ...]``.
+
+    ``expect_audio`` says which way the audio check points. Off (the default) an
+    audio stream is the finding, because the production asked for picture only.
+    On, a MISSING stream is the finding: a production whose sound is part of the
+    deliverable would otherwise pass QA while being silent, while the one-way
+    check flagged every correct clip instead.
     """
     work = Path(work_dir)
     report = ContinuityReport()
@@ -162,7 +169,10 @@ def collect_evidence(
         if facts.duration_seconds and abs(facts.duration_seconds - expected_duration) > duration_tolerance:
             report.measured_findings.append(
                 f"{act_id}: duration {facts.duration_seconds:.3f}s, expected ~{expected_duration}s")
-        if facts.audio_streams:
+        if expect_audio and not facts.audio_streams:
+            report.measured_findings.append(
+                f"{act_id}: no audio stream; generated audio was requested")
+        elif facts.audio_streams and not expect_audio:
             report.measured_findings.append(
                 f"{act_id}: {facts.audio_streams} audio stream(s) present; picture-only was requested")
 
@@ -192,25 +202,71 @@ def collect_evidence(
     return report
 
 
+def _image_size(path: str | Path) -> Optional[tuple[int, int]]:
+    """Pixel size of one pane, used as the box every other pane is fitted into."""
+    wh = _ffprobe(path, ["-select_streams", "v:0", "-show_entries",
+                         "stream=width,height", "-of", "csv=p=0"])
+    parts = [f for line in wh.splitlines() for f in line.split(",") if f.strip()]
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
 def build_contact_sheet(report: ContinuityReport, out_path: str | Path, columns: int = 2) -> Optional[Path]:
     """Tile every boundary pair into one image so the agent reads it in one look.
 
     Side-by-side is the point: identity drift is obvious in a pair and easy to
     miss when the frames are viewed apart.
+
+    Each pane must therefore actually BE in the sheet. `tile` is a single-input
+    filter: fed N separate `-i` inputs it only ever consumed input 0, so every
+    sheet was pane 1 repeated with the rest black — and it exited 0, so nothing
+    flagged it. Found 2026-09-21 on the A1->A2 boundary, where the evidence for
+    a $0.20 chained act was a black rectangle. The panes are concatenated into
+    one stream first, so `tile` sees the N frames it is being asked to lay out.
+
+    concat requires identical geometry, which the old tile-pads-it behaviour did
+    not — mismatched aspect ratios are exactly what this module exists to flag,
+    so each pane is letterboxed into the first pane's box rather than rejected.
     """
     if not report.boundaries:
         return None
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    inputs: list[str] = []
+
+    panes: list[str] = []
     for b in report.boundaries:
-        inputs += ["-i", b.last_frame_of_previous, "-i", b.first_frame_of_next]
-    rows = len(report.boundaries)
-    # ffmpeg's tile filter needs uniform input dimensions, and mismatched clip
-    # aspect ratios are exactly what this module exists to flag — so the sheet
-    # must not be the thing that crashes when it finds one.
+        panes += [b.last_frame_of_previous, b.first_frame_of_next]
+    inputs: list[str] = []
+    for pane in panes:
+        inputs += ["-i", pane]
+
+    box = _image_size(panes[0])
+    if box is None:
+        report.measured_findings.append(
+            f"contact sheet could not be built: pane {panes[0]} is unreadable")
+        return None
+    # scale() rounds each side to an even number, which can overshoot an odd box
+    # by a pixel and make pad() fail ("Padded dimensions cannot be smaller than
+    # input dimensions") — _extract's scale=220:-1 produces exactly such a box.
+    # An even box cannot be overshot by that rounding.
+    w, h = (d + d % 2 for d in box)
+    rows = -(-len(panes) // columns)  # ceil: every pane gets a cell
+
+    normalise = "".join(
+        f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[p{i}];"
+        for i in range(len(panes))
+    )
+    joined = "".join(f"[p{i}]" for i in range(len(panes)))
+    graph = (f"{normalise}{joined}concat=n={len(panes)}:v=1:a=0[panes];"
+             f"[panes]tile={columns}x{rows}")
+
     proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", *inputs,
-                           "-filter_complex", f"tile={columns}x{rows}", str(out)],
+                           "-filter_complex", graph, "-frames:v", "1", str(out)],
                           capture_output=True, text=True)
     if proc.returncode != 0 or not out.exists():
         report.measured_findings.append(

@@ -12,6 +12,7 @@ Discovery is automatic: this class declares capability="video_generation", so
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -32,10 +33,24 @@ from tools.base_tool import (
 _API_BASE = "https://openrouter.ai/api/v1"
 _DEFAULT_MODEL = "google/veo-3.1-lite"
 
-# Vertical social delivery target. 2K is opt-in, never the default — the H3 A/B
-# experiment showed 2K triples the bill for pixels a 1080p timeline throws away.
-_DEFAULT_RESOLUTION = "1080x1920"
+# Vertical social delivery target: 1080p at 9:16 IS 1080x1920. 2K is opt-in,
+# never the default — the H3 A/B experiment showed 2K triples the bill for pixels
+# a 1080p timeline throws away.
+#
+# The provider's `resolution` field is a TIER ENUM, not a pixel size. It used to
+# default to "1080x1920" here, which every submit rejected with a 400 ZodError
+# naming 360p|480p|720p|768p|1080p|1K|2K|4K — i.e. the default-parameter path
+# could not generate at all (found on the 2026-09-21 A1 reseed, which only went
+# through after the payload was corrected by hand). The delivery frame size is
+# still what callers think in, so _normalize_resolution maps a WIDTHxHEIGHT onto
+# its tier rather than pushing the wire format onto every caller.
+_DEFAULT_RESOLUTION = "1080p"
 _DEFAULT_ASPECT_RATIO = "9:16"
+_RESOLUTION_TIERS = ("360p", "480p", "720p", "768p", "1080p", "1K", "2K", "4K")
+# Keyed on the SHORT side, which is the side a provider tier names: 1080x1920
+# vertical and 1920x1080 horizontal are both the 1080p tier.
+_SHORT_SIDE_TO_TIER = {360: "360p", 480: "480p", 720: "720p", 768: "768p",
+                       1024: "1K", 1080: "1080p", 1440: "2K", 2160: "4K"}
 _DEFAULT_ACT_SECONDS = 5
 
 # Per-second fallback rates, used ONLY when a real charge is unavailable — i.e.
@@ -51,6 +66,11 @@ _RATE_USD_PER_SECOND: dict[str, float] = {
     # The collection page lists this model "from $0.05/s"; that rate did not
     # match the actual charge for this configuration. Higher resolutions or
     # audio-on may still bill above this.
+    #
+    # ALSO MEASURED 2026-09-21: the same job at 1080p billed $0.20 => $0.05/s,
+    # so this rate under-quotes the adapter's own default resolution. The table
+    # is per-model only and estimate_cost does not read `resolution`; treat its
+    # number as a floor and read usage.cost for the charge.
     "google/veo-3.1-lite": 0.03,
     "google/veo-3.1-fast": 0.10,
     "bytedance/seedance-2.0-mini": 0.03363,
@@ -63,6 +83,31 @@ _RATE_USD_PER_SECOND: dict[str, float] = {
     "x-ai/grok-imagine-video-1.5": 0.08,
 }
 _FALLBACK_RATE_USD_PER_SECOND = 0.10
+
+# Per-second prices that actually depend on resolution and audio, keyed
+# (model, resolution tier, audio on). Published as `pricing_skus` by
+# GET /api/v1/videos/models (free metadata, no credits) and confirmed against
+# real charges: 4s @ 1080p audio-off billed $0.20, 4s @ 720p audio-off $0.12.
+# The flat per-model table above under-quoted the adapter default by 67%,
+# which matters because the cost is what a human approves before a run.
+_RATE_SKUS_USD_PER_SECOND: dict[str, dict[tuple[str, bool], float]] = {
+    "google/veo-3.1-lite": {
+        ("720p", False): 0.03, ("720p", True): 0.05,
+        ("1080p", False): 0.05, ("1080p", True): 0.08,
+    },
+}
+
+# Frame-conditioning semantics, from OBSERVED provider behaviour rather than
+# from the capability listing, which does not distinguish them. "interpolation"
+# means last_frame is only valid alongside first_frame: on 2026-09-21 a
+# last_frame-only job on google/veo-3.1-lite was rejected by the provider with
+# "Frame interpolation requires both an input image and a last frame."
+# (The failed job was not billed.) A model that is not listed here is UNKNOWN,
+# and unknown is not a licence to guess - such a model is passed through
+# untouched so this adapter cannot break semantics it has never tested.
+_FRAME_SEMANTICS_BY_PREFIX: dict[str, str] = {
+    "google/veo-": "interpolation",
+}
 
 # OpenRouter's request body has no negative_prompt field. Rather than drop the
 # negatives — or gamble on the undocumented `provider` passthrough — they are
@@ -111,6 +156,9 @@ class OpenRouterVideo(BaseTool):
     supports = {
         "text_to_video": True,
         "image_to_video": True,
+        # Both ends, via the ergonomic first_frame/last_frame inputs and via
+        # explicit frame_images entries. Per-model support varies - read
+        # supported_frame_images from GET /api/v1/videos/models.
         "first_last_frame": True,
         "reference_image": True,
         "multiple_reference_images": True,
@@ -155,11 +203,15 @@ class OpenRouterVideo(BaseTool):
             "resolution": {
                 "type": "string",
                 "default": _DEFAULT_RESOLUTION,
+                "enum": list(_RESOLUTION_TIERS),
                 "description": (
-                    "Default 1080x1920 — the vertical social delivery target. Accepts a tier "
-                    "(720p, 1080p, 2K, 4K) or WIDTHxHEIGHT. 2K is an optional high-quality mode, "
-                    "not a default: it costs more and is wasted on a 1080p timeline. Some models "
-                    "support only one tier and reject the rest at validation."
+                    "Default 1080p, which at aspect_ratio 9:16 is the 1080x1920 vertical social "
+                    "delivery target. The provider accepts ONLY a tier (360p, 480p, 720p, 768p, "
+                    "1080p, 1K, 2K, 4K) — a WIDTHxHEIGHT is a 400, so one is normalised to the "
+                    "tier of its short side (1080x1920 -> 1080p) before it is sent. 2K is an "
+                    "optional high-quality mode, not a default: it costs more and is wasted on a "
+                    "1080p timeline. Some models support only one tier and reject the rest at "
+                    "validation."
                 ),
             },
             "aspect_ratio": {
@@ -197,7 +249,16 @@ class OpenRouterVideo(BaseTool):
             },
             "input_references": {
                 "type": "array",
-                "description": "Style/identity guidance images",
+                "description": (
+                    "Identity/style anchor images, e.g. the one tool that must look the same in "
+                    "every act. Entries are normalised and validated exactly like frame_images: a "
+                    "bare string, a local path, an https URL or a data URI all become "
+                    "{type: 'image_url', image_url: {url}}. Local paths are read, so they are "
+                    "confined to the working tree, checked by image magic bytes and size-capped. "
+                    "NOTE: the unified API accepts this field, but a given upstream model may "
+                    "ignore it - check GET /api/v1/videos/models for that model's advertised "
+                    "capabilities before relying on it."
+                ),
                 "items": {"type": "object"},
             },
             "output_path": {"type": "string", "default": "openrouter_output.mp4"},
@@ -207,6 +268,15 @@ class OpenRouterVideo(BaseTool):
                     "Convenience form of frame_images: a local image path, an https URL or a "
                     "data: URI to condition this clip's opening frame on. This is the "
                     "cross-clip continuity mechanism — pass the previous act's final frame."
+                ),
+            },
+            "last_frame": {
+                "type": "string",
+                "description": (
+                    "Convenience form of frame_images for the CLOSING frame, same accepted "
+                    "inputs and same guards as first_frame. Optional and independent: a clip "
+                    "may pin neither end, either end, or both. Check the model advertises it "
+                    "(supported_frame_images in GET /api/v1/videos/models) before relying on it."
                 ),
             },
         },
@@ -246,6 +316,70 @@ class OpenRouterVideo(BaseTool):
     @staticmethod
     def _rate(model: str) -> float:
         return _RATE_USD_PER_SECOND.get(model, _FALLBACK_RATE_USD_PER_SECOND)
+
+    @staticmethod
+    def frame_semantics(model: str) -> str | None:
+        """How this model treats frame conditioning, or None when untested.
+
+        "interpolation" - last_frame is only valid together with first_frame.
+        None - unknown; callers must not assume either way.
+        """
+        for prefix, semantics in _FRAME_SEMANTICS_BY_PREFIX.items():
+            if str(model).startswith(prefix):
+                return semantics
+        return None
+
+    @classmethod
+    def fetch_model_capabilities(cls, model: str | None = None, timeout: int = 30) -> Any:
+        """Read the provider capability listing. Metadata only - never billed.
+
+        Returns one model dict when `model` is given (None if absent), else the
+        full list. Each entry carries supported_resolutions, supported_sizes,
+        supported_durations, supported_frame_images, generate_audio, seed,
+        pricing_skus and allowed_passthrough_parameters.
+
+        Nothing calls this automatically: it is a live network read, and the
+        adapter must stay usable offline and in tests. Planners call it to pick
+        a mechanism. NOTE what it does NOT report: there is no reference-image
+        field in the listing at all, so `input_references` support cannot be
+        established from it for any model.
+        """
+        key = cls._api_key()
+        if not key:
+            raise RuntimeError("OPENROUTER_API_KEY not set")
+        import requests
+
+        resp = requests.get(f"{_API_BASE}/videos/models", headers=cls._headers(key), timeout=timeout)
+        resp.raise_for_status()
+        body = resp.json()
+        models = body.get("data", body) if isinstance(body, dict) else body
+        if model is None:
+            return models
+        return next((m for m in models if m.get("id") == model), None)
+
+    @classmethod
+    def _normalize_resolution(cls, value: Any) -> str:
+        """Return a tier the provider's enum accepts, or refuse before spending.
+
+        An unmappable value raises rather than falling back to a default: a
+        silent downgrade would bill for a resolution nobody asked for, and
+        execute() turns this into a structured failure before any submit.
+        """
+        raw = str(value or _DEFAULT_RESOLUTION).strip()
+        for tier in _RESOLUTION_TIERS:
+            if raw.lower() == tier.lower():
+                return tier
+        pixels = re.fullmatch(r"(\d+)\s*[xX×]\s*(\d+)", raw)
+        if pixels:
+            tier = _SHORT_SIDE_TO_TIER.get(min(int(pixels[1]), int(pixels[2])))
+            if tier:
+                return tier
+        raise ValueError(
+            f"resolution {raw!r} is not a provider tier ({', '.join(_RESOLUTION_TIERS)}). "
+            "A WIDTHxHEIGHT is accepted only when its short side maps to a tier, "
+            "e.g. 1080x1920 -> 1080p. The provider validates this field: a pixel "
+            "size it cannot map is a 400."
+        )
 
     @staticmethod
     def _assemble_prompt(prompt: str, negative_prompt: str | None) -> str:
@@ -347,6 +481,33 @@ class OpenRouterVideo(BaseTool):
                 "image_url": {"url": cls._to_data_uri(url)},
                 "frame_type": frame_type}
 
+    @classmethod
+    def _normalize_reference_image(cls, entry: Any) -> dict:
+        """Rewrite a reference entry into the image_url shape, with the same guards.
+
+        Reference images were previously forwarded VERBATIM, which meant a local
+        path was shipped as a raw string (the provider cannot read our disk) and,
+        worse, that this input bypassed the working-tree / magic-byte / size
+        checks every other image input goes through. Same bytes leave the
+        machine either way, so they get the same guard.
+
+        Unlike frame_images there is no frame_type: a reference is not a
+        position in time. Any other keys the caller set are preserved, so a
+        provider-specific hint (weight, role, ...) still reaches the API.
+        """
+        if isinstance(entry, str):
+            return {"type": "image_url", "image_url": {"url": cls._to_data_uri(entry)}}
+        if isinstance(entry, dict):
+            raw = entry.get("image_url", entry.get("url"))
+            url = raw.get("url") if isinstance(raw, dict) else raw
+            if not url or not isinstance(url, str):
+                raise ValueError(f"reference image entry has no usable url: {entry!r}")
+            out = {k: v for k, v in entry.items() if k not in ("image_url", "url")}
+            out.setdefault("type", "image_url")
+            out["image_url"] = {"url": cls._to_data_uri(url)}
+            return out
+        raise ValueError(f"unsupported reference image entry: {entry!r}")
+
     def _build_payload(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Assemble the POST /videos body. Optional keys are omitted, not nulled.
 
@@ -357,21 +518,54 @@ class OpenRouterVideo(BaseTool):
             "model": str(inputs.get("model") or _DEFAULT_MODEL),
             "prompt": self._assemble_prompt(inputs["prompt"], inputs.get("negative_prompt")),
             "duration": int(inputs.get("duration", _DEFAULT_ACT_SECONDS)),
-            "resolution": str(inputs.get("resolution", _DEFAULT_RESOLUTION)),
+            "resolution": self._normalize_resolution(inputs.get("resolution", _DEFAULT_RESOLUTION)),
             "aspect_ratio": str(inputs.get("aspect_ratio", _DEFAULT_ASPECT_RATIO)),
             "generate_audio": bool(inputs.get("generate_audio", False)),
         }
-        for optional in ("seed", "input_references"):
-            if inputs.get(optional) is not None:
-                payload[optional] = inputs[optional]
+        if inputs.get("seed") is not None:
+            payload["seed"] = inputs["seed"]
 
-        # `first_frame` is the ergonomic chaining input; frame_images is the
-        # explicit one. Both end up in the same normalised list.
+        # Identity anchors. Normalised and guarded like frame_images rather than
+        # forwarded raw - see _normalize_reference_image. An empty list stays
+        # absent from the body; optional keys are omitted, never nulled.
+        if inputs.get("input_references"):
+            payload["input_references"] = [
+                self._normalize_reference_image(r) for r in inputs["input_references"]
+            ]
+
+        # `first_frame` / `last_frame` are the ergonomic conditioning inputs;
+        # frame_images is the explicit one. All end up in the same normalised
+        # list, which is where the working-tree, magic-byte and size guards live.
+        # Pinning the closing frame is the other half of a capability the models
+        # already advertise: GET /api/v1/videos/models reports
+        # supported_frame_images: ["first_frame", "last_frame"] for the Veo,
+        # Seedance, Kling, Hailuo and Wan 2.7 families (checked 2026-09-21), and
+        # only "first_frame" for several others - so it is optional, never
+        # implied, and the caller checks the model.
         frames: list[Any] = []
         if inputs.get("first_frame"):
             frames.append({"frame_type": "first_frame", "image_url": inputs["first_frame"]})
+        if inputs.get("last_frame"):
+            frames.append({"frame_type": "last_frame", "image_url": inputs["last_frame"]})
         if inputs.get("frame_images"):
             frames.extend(inputs["frame_images"])
+
+        # Fail here rather than at the provider, for models whose last_frame is
+        # an interpolation endpoint rather than a standalone pin. Costs nothing
+        # either way (a failed job is not billed) but the local error names the
+        # cause instead of surfacing a backend string minutes later. Untested
+        # models are left alone - see _FRAME_SEMANTICS_BY_PREFIX.
+        if self.frame_semantics(payload["model"]) == "interpolation":
+            types = {f.get("frame_type") for f in frames if isinstance(f, dict)}
+            if "last_frame" in types and "first_frame" not in types:
+                raise ValueError(
+                    f"{payload['model']} treats last_frame as an interpolation endpoint: it "
+                    "requires a first_frame as well. Provider error when sent alone: "
+                    "'Frame interpolation requires both an input image and a last frame.' "
+                    "Send both frames (an interpolation between two known states), or send "
+                    "first_frame alone for ordinary image-to-video conditioning. last_frame "
+                    "is not an object-identity mechanism."
+                )
         if frames:
             payload["frame_images"] = [self._normalize_frame_image(f) for f in frames]
         return payload
@@ -380,8 +574,30 @@ class OpenRouterVideo(BaseTool):
         return ToolStatus.AVAILABLE if self._api_key() else ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
+        """Price the job at the SKU that actually applies.
+
+        Resolution and audio move the charge - 1080p audio-off costs 67% more
+        per second than 720p on veo-3.1-lite - so a per-model flat rate
+        under-quotes whatever a human is about to approve. Falls back to the
+        flat table for models with no published SKUs, and to the dearest known
+        SKU for an unrecognised resolution tier, because an estimate that is
+        too low is the one that causes harm.
+        """
         duration = int(inputs.get("duration", _DEFAULT_ACT_SECONDS) or _DEFAULT_ACT_SECONDS)
-        return round(self._rate(str(inputs.get("model") or _DEFAULT_MODEL)) * duration, 4)
+        model = str(inputs.get("model") or _DEFAULT_MODEL)
+        skus = _RATE_SKUS_USD_PER_SECOND.get(model)
+        if not skus:
+            return round(self._rate(model) * duration, 4)
+
+        audio = bool(inputs.get("generate_audio", False))
+        try:
+            tier = self._normalize_resolution(inputs.get("resolution", _DEFAULT_RESOLUTION))
+        except ValueError:
+            tier = None
+        rate = skus.get((tier, audio))
+        if rate is None:
+            rate = max(r for (_t, a), r in skus.items() if a == audio)
+        return round(rate * duration, 4)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         return 120.0

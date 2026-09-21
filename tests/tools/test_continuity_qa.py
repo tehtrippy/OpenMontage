@@ -122,6 +122,102 @@ class TestRefusesToScoreSemantics:
             assert required in SEMANTIC_CHECKS
 
 
+def _solid(path, color, width=100, height=150):
+    """A single-colour pane, so a cell in the sheet can be identified by its mean."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c={color}:s={width}x{height}:d=1", "-frames:v", "1", str(path)],
+        check=True,
+    )
+    return str(path)
+
+
+def _report_of_panes(pane_paths):
+    """A report whose boundaries point straight at the given panes, in order."""
+    from lib.continuity_qa import BoundaryEvidence, ContinuityReport
+
+    report = ContinuityReport()
+    for i in range(0, len(pane_paths), 2):
+        report.boundaries.append(BoundaryEvidence(
+            from_act=f"A{i // 2 + 1}", to_act=f"A{i // 2 + 2}",
+            last_frame_of_previous=pane_paths[i], first_frame_of_next=pane_paths[i + 1]))
+    return report
+
+
+def _cells(sheet_path, columns, rows):
+    """Mean RGB of each grid cell, row-major — the order build_contact_sheet lays out."""
+    import numpy as np
+    from PIL import Image
+
+    img = np.asarray(Image.open(sheet_path).convert("RGB"), dtype=float)
+    h, w, _ = img.shape
+    ch, cw = h // rows, w // columns
+    out = []
+    for r in range(rows):
+        for c in range(columns):
+            # Centre crop: the pad/letterbox border is not what identifies a pane.
+            cell = img[r * ch + ch // 4: r * ch + 3 * ch // 4,
+                       c * cw + cw // 4: c * cw + 3 * cw // 4]
+            out.append(tuple(cell.reshape(-1, 3).mean(axis=0)))
+    return out
+
+
+class TestContactSheetContainsEveryPane:
+    """`tile` is a single-input filter.
+
+    Fed N separate `-i` inputs it consumed only input 0, so every sheet was pane
+    1 repeated and the rest black — while exiting 0, so nothing flagged it. The
+    old test only asserted the file existed, which a black sheet satisfies.
+    """
+
+    COLOURS = ["red", "lime", "blue", "yellow", "magenta", "cyan"]
+    RGB = {"red": (255, 0, 0), "lime": (0, 255, 0), "blue": (0, 0, 255),
+           "yellow": (255, 255, 0), "magenta": (255, 0, 255), "cyan": (0, 255, 255)}
+
+    def _sheet(self, tmp_path, n_panes, columns=2):
+        panes = [_solid(tmp_path / f"p{i}.png", self.COLOURS[i]) for i in range(n_panes)]
+        report = _report_of_panes(panes)
+        out = build_contact_sheet(report, tmp_path / "sheet.png", columns=columns)
+        assert out is not None and out.exists(), report.measured_findings
+        rows = -(-n_panes // columns)
+        return _cells(out, columns, rows), panes
+
+    def test_each_pane_appears_once_in_order(self, tmp_path):
+        cells, _ = self._sheet(tmp_path, 6)
+        for cell, colour in zip(cells, self.COLOURS):
+            expected = self.RGB[colour]
+            assert all(abs(got - want) < 40 for got, want in zip(cell, expected)),                 f"expected {colour} {expected}, got {cell}"
+
+    def test_no_pane_is_repeated(self, tmp_path):
+        cells, _ = self._sheet(tmp_path, 6)
+        rounded = {tuple(round(v / 32) for v in cell) for cell in cells}
+        assert len(rounded) == 6, f"only {len(rounded)} distinct panes in a 6-pane sheet"
+
+    def test_no_cell_is_black_from_the_tiling(self, tmp_path):
+        """Every input was bright, so a dark cell means a cell got no input."""
+        cells, _ = self._sheet(tmp_path, 6)
+        for i, cell in enumerate(cells):
+            assert max(cell) > 60, f"cell {i} is black: {cell}"
+
+    def test_single_boundary_two_panes_still_works(self, tmp_path):
+        cells, _ = self._sheet(tmp_path, 2)
+        assert len(cells) == 2
+        assert all(abs(g - w) < 40 for g, w in zip(cells[0], self.RGB["red"]))
+        assert all(abs(g - w) < 40 for g, w in zip(cells[1], self.RGB["lime"]))
+        assert cells[0] != cells[1]
+
+    def test_real_boundary_panes_are_not_identical(self, tmp_path):
+        """End to end through collect_evidence: a red clip and a blue clip."""
+        clips = [("A1", str(_make_clip(tmp_path / "a1.mp4", color="red"))),
+                 ("A2", str(_make_clip(tmp_path / "a2.mp4", color="blue")))]
+        report = collect_evidence(clips, tmp_path / "qa")
+        out = build_contact_sheet(report, tmp_path / "qa" / "sheet.png")
+        assert out is not None
+        left, right = _cells(out, 2, 1)
+        assert left[0] > left[2] and right[2] > right[0], (left, right)
+
+
 class TestContactSheet:
     def test_tiles_every_boundary_pair(self, tmp_path):
         clips = [(f"A{i}", str(_make_clip(tmp_path / f"a{i}.mp4"))) for i in (1, 2, 3)]
@@ -262,3 +358,51 @@ class TestEndFrameMatchesTheChainHandoff:
         assert "-ss" in seen["cmd"]
         assert "0.1" in seen["cmd"]
         assert "-frames:v" in seen["cmd"]
+
+
+class TestAudioExpectation:
+    """Which way the audio check points is a property of the production.
+
+    Picture-only work wants a stream to be a finding. Work whose sound IS the
+    deliverable wants the opposite - and the one-way check flagged every correct
+    clip while letting a silent one through.
+    """
+
+    @staticmethod
+    def _clip_with_tone(path, seconds=1):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", f"color=c=red:s=108x192:d={seconds}:r=10",
+             "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+             "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)],
+            check=True)
+        return path
+
+    def test_missing_audio_is_a_finding_when_audio_was_generated(self, tmp_path):
+        silent = _make_clip(tmp_path / "a.mp4")
+        report = collect_evidence([("A1", str(silent))], tmp_path / "qa",
+                                  expected_width=108, expected_height=192,
+                                  expected_duration=1.0, expect_audio=True)
+        assert any("no audio stream" in f for f in report.measured_findings)
+
+    def test_present_audio_is_clean_when_audio_was_generated(self, tmp_path):
+        clip = self._clip_with_tone(tmp_path / "a.mp4")
+        report = collect_evidence([("A1", str(clip))], tmp_path / "qa",
+                                  expected_width=108, expected_height=192,
+                                  expected_duration=1.0, expect_audio=True)
+        assert report.measured_findings == []
+
+    def test_picture_only_behaviour_is_unchanged(self, tmp_path):
+        clip = self._clip_with_tone(tmp_path / "a.mp4")
+        report = collect_evidence([("A1", str(clip))], tmp_path / "qa",
+                                  expected_width=108, expected_height=192,
+                                  expected_duration=1.0)
+        assert any("picture-only was requested" in f for f in report.measured_findings)
+
+    def test_silent_clip_is_clean_when_picture_only(self, tmp_path):
+        silent = _make_clip(tmp_path / "a.mp4")
+        report = collect_evidence([("A1", str(silent))], tmp_path / "qa",
+                                  expected_width=108, expected_height=192,
+                                  expected_duration=1.0)
+        assert report.measured_findings == []
