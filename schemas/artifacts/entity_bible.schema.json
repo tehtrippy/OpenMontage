@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "entity_bible",
+  "description": "Persistent entities a production must keep identical across generated clips. Scene plans and prompts reference entities by entity_id so identity is stated once and cited everywhere, instead of being re-described (and re-invented) per beat. Covers process subjects (tools, containers, ingredients, work surfaces) and narrative subjects (characters, clothing, props, locations, vehicles) with the same shape.",
+  "type": "object",
+  "required": ["version", "entities"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": "1.0" },
+    "project_id": { "type": "string" },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entity_id", "type", "visual_description"],
+        "additionalProperties": false,
+        "properties": {
+          "entity_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*$",
+            "description": "Stable handle cited by scene plans and prompts, e.g. working_glass."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["character", "clothing", "prop", "tool", "container", "ingredient",
+                     "material", "machine", "work_surface", "location", "vehicle", "environment", "other"]
+          },
+          "visual_description": {
+            "type": "string",
+            "description": "One paragraph a generator can render from. Concrete and discriminating: what makes THIS one recognisable, not a category description."
+          },
+          "identity_constraints": {
+            "type": "array", "items": { "type": "string" },
+            "description": "What must be true in every frame this entity appears in."
+          },
+          "continuity_constraints": {
+            "type": "array", "items": { "type": "string" },
+            "description": "What must hold ACROSS clips — the cross-boundary rules."
+          },
+          "allowed_changes": {
+            "type": "array", "items": { "type": "string" },
+            "description": "Changes that are part of the story (a glass filling, a shirt getting wet). Without this an entity reads as frozen and legitimate transformation looks like a defect."
+          },
+          "forbidden_changes": {
+            "type": "array", "items": { "type": "string" },
+            "description": "Changes that are defects (silhouette shifts, ingredient identity swaps, teleportation)."
+          },
+          "first_introduced_in": {
+            "type": "string",
+            "description": "Act or beat id where a hand/camera introduces it. An entity with no introduction is the un-introduced-object defect."
+          },
+          "removed_in": { "type": "string" },
+          "reference_images": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "global_forbidden_changes": {
+      "type": "array", "items": { "type": "string" },
+      "description": "Rules applying to every entity, e.g. nothing appears without a hand introducing it."
+    },
+    "metadata": { "type": "object" }
+  }
+}

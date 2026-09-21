@@ -2895,10 +2895,15 @@ class VideoCompose(BaseTool):
 
         # Layer 2: edit_decisions subtitle style
         if edit_decisions:
+            # edit_decisions.schema.json types subtitles.style as a STRING (a
+            # style name or note), while this merge wants a field->value dict.
+            # Both occur in the wild, so accept a dict and ignore anything else
+            # rather than raising on a schema-valid artifact.
             ed_style = edit_decisions.get("subtitles", {}).get("style", {})
-            for k, v in ed_style.items():
-                if v is not None:
-                    resolved[k] = v
+            if isinstance(ed_style, dict):
+                for k, v in ed_style.items():
+                    if v is not None:
+                        resolved[k] = v
 
         # Layer 3: Explicit override (highest priority)
         if explicit_style:

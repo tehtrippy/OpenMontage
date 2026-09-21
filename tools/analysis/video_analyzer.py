@@ -88,6 +88,17 @@ class VideoAnalyzer(BaseTool):
                     "deep: + intra-scene sampling + detailed style extraction."
                 ),
             },
+            "transition_sampling": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Also sample a frame near the END of each scene and emit a `transitions` "
+                    "block pairing each scene's end state with the next scene's start state. "
+                    "Off by default so existing analyses are byte-for-byte unchanged. Turn it on "
+                    "for reference-driven work, where the ACTION between two states matters as "
+                    "much as the states."
+                ),
+            },
             "max_keyframes": {
                 "type": "integer",
                 "default": 20,
@@ -443,7 +454,10 @@ class VideoAnalyzer(BaseTool):
         if video_path and scenes:
             try:
                 # Extract keyframes at scene boundaries + midpoints
-                timestamps = self._compute_keyframe_timestamps(scenes, max_keyframes, depth)
+                transition_sampling = bool(inputs.get("transition_sampling", False))
+                timestamps = self._compute_keyframe_timestamps(
+                    scenes, max_keyframes, depth, transition_sampling
+                )
 
                 from tools.analysis.frame_sampler import FrameSampler
                 sampler = FrameSampler()
@@ -468,6 +482,9 @@ class VideoAnalyzer(BaseTool):
                             "description": "",  # Agent fills via vision
                         })
                     steps_completed.append("keyframes")
+                    if transition_sampling:
+                        brief["transitions"] = self._build_transitions(scenes, keyframes)
+                        steps_completed.append("transition_sampling")
             except Exception as e:
                 steps_failed.append(f"keyframes: {e}")
         elif video_path and not scenes:
@@ -600,9 +617,19 @@ class VideoAnalyzer(BaseTool):
         return float(data.get("format", {}).get("duration", 0))
 
     def _compute_keyframe_timestamps(
-        self, scenes: list[dict], max_frames: int, depth: str
+        self, scenes: list[dict], max_frames: int, depth: str,
+        transition_sampling: bool = False
     ) -> list[float]:
-        """Compute optimal keyframe timestamps from scene boundaries."""
+        """Compute optimal keyframe timestamps from scene boundaries.
+
+        With ``transition_sampling`` the sampler also takes a frame near the END
+        of each scene. One frame per scene only ever shows the state a cut lands
+        on, so an action that happens inside a scene — a hand tipping one glass
+        into another, ice going into a glass — is invisible and the brief
+        records a state list with the causes removed. A start/end pair per scene
+        makes the within-scene change observable, and pairing scene N's end with
+        scene N+1's start makes the across-cut change observable.
+        """
         timestamps = []
 
         for scene in scenes:
@@ -612,6 +639,11 @@ class VideoAnalyzer(BaseTool):
 
             # First frame of each scene
             timestamps.append(start + 0.1)
+
+            # Pre-cut frame: the state the scene ENDS on, so the pair
+            # (start, end) brackets whatever action happened inside it.
+            if transition_sampling and duration > 0.3:
+                timestamps.append(max(start + 0.15, end - 0.12))
 
             # Midpoint for scenes > 3 seconds
             if duration > 3.0:
@@ -639,6 +671,47 @@ class VideoAnalyzer(BaseTool):
             if start <= ts <= end:
                 return scene.get("index", scene.get("scene_index", 0))
         return 0
+
+    def _build_transitions(
+        self, scenes: list[dict], keyframes: list[dict]
+    ) -> list[dict]:
+        """Pair each cut with the frames bracketing it.
+
+        Produces one entry per boundary carrying four timestamps: the state the
+        outgoing scene opens on, the state it ends on, and the same for the
+        incoming scene. The agent reads those four frames and writes the ACTION
+        that connects them. The tool deliberately does not guess the action —
+        it only guarantees the evidence exists.
+        """
+        by_scene: dict[int, list[dict]] = {}
+        for kf in keyframes:
+            by_scene.setdefault(kf["scene_index"], []).append(kf)
+        for frames in by_scene.values():
+            frames.sort(key=lambda f: f["timestamp"])
+
+        transitions = []
+        for i in range(len(scenes) - 1):
+            out_idx = scenes[i].get("index", scenes[i].get("scene_index", i))
+            in_idx = scenes[i + 1].get("index", scenes[i + 1].get("scene_index", i + 1))
+            out_frames = by_scene.get(out_idx, [])
+            in_frames = by_scene.get(in_idx, [])
+            if not out_frames or not in_frames:
+                continue
+            transitions.append({
+                "boundary_index": i,
+                "at_seconds": scenes[i].get("end_seconds", 0),
+                "from_scene": out_idx,
+                "to_scene": in_idx,
+                "before_frames": [f["path"] for f in out_frames],
+                "after_frames": [f["path"] for f in in_frames],
+                "state_before_seconds": out_frames[-1]["timestamp"],
+                "state_after_seconds": in_frames[0]["timestamp"],
+                "within_scene_change_observable": len(out_frames) > 1,
+                "action": "",            # agent fills from the bracketing frames
+                "elided": None,          # agent sets True when the cut hides the action
+                "confidence": None,
+            })
+        return transitions
 
     def _classify_pacing(self, durations: list[float]) -> str:
         """Classify pacing style from scene durations."""
