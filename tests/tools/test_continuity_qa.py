@@ -176,3 +176,89 @@ class TestDegradesInsteadOfCrashing:
         monkeypatch.setattr("lib.continuity_qa.subprocess.run", failing)
         assert build_contact_sheet(report, tmp_path / "qa" / "sheet.jpg") is None
         assert any("contact sheet could not be built" in f for f in report.measured_findings)
+
+
+class TestEndFrameMatchesTheChainHandoff:
+    """The evidence pane must show the frame the chain actually handed forward.
+
+    Sampling the end frame 0.1s early made the QA evidence disagree with the
+    run itself — on the 2026-09-21 A1 diagnostic that gap read as a generation
+    defect and cost a $0.20 reroll.
+    """
+
+    def _ramp_clip(self, path, n_frames=24, fps=24):
+        from PIL import Image
+        src = path.parent / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        values = [10 * (i + 1) for i in range(n_frames)]
+        for i, v in enumerate(values):
+            Image.new("RGB", (160, 288), (v, v, v)).save(src / f"{i:04d}.png")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-framerate", str(fps),
+                        "-i", str(src / "%04d.png"), "-c:v", "libx264", "-qp", "0",
+                        "-pix_fmt", "yuv444p", str(path)], check=True)
+        return values
+
+    def test_end_frame_is_the_true_final_frame(self, tmp_path):
+        import numpy as np
+        from PIL import Image
+        from lib.continuity_qa import _extract
+
+        clip = tmp_path / "ramp.mp4"
+        values = self._ramp_clip(clip)
+        out = _extract(clip, tmp_path / "end.jpg", at_end=True, width=160)
+        grey = float(np.asarray(Image.open(out).convert("L"), dtype=float).mean())
+        assert grey == pytest.approx(values[-1], abs=4)
+
+    def test_end_frame_matches_what_the_chain_extractor_returns(self, tmp_path):
+        """One clip, both extractors, same frame. They must not drift apart."""
+        import numpy as np
+        from PIL import Image
+        from lib.causal_chain import extract_final_frame
+        from lib.continuity_qa import _extract
+
+        clip = tmp_path / "ramp.mp4"
+        self._ramp_clip(clip)
+        qa = _extract(clip, tmp_path / "qa_end.jpg", at_end=True, width=160)
+        chain = extract_final_frame(clip, tmp_path / "chain_end.jpg")
+
+        def grey(p):
+            return float(np.asarray(Image.open(p).convert("L"), dtype=float).mean())
+
+        assert grey(qa) == pytest.approx(grey(chain), abs=4)
+
+    def test_end_frame_command_does_not_seek(self, monkeypatch, tmp_path):
+        from pathlib import Path
+        from lib.continuity_qa import _extract
+        seen = {}
+
+        def fake_run(cmd, *a, **k):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"\xff\xd8\xff" + b"x" * 64)
+            class R:
+                returncode = 0
+            return R()
+
+        monkeypatch.setattr("lib.continuity_qa.subprocess.run", fake_run)
+        _extract(tmp_path / "in.mp4", tmp_path / "out.jpg", at_end=True)
+        assert "-sseof" not in seen["cmd"]
+        assert "-update" in seen["cmd"]
+        assert "-frames:v" not in seen["cmd"]
+
+    def test_start_frame_still_seeks_past_the_lead_in(self, monkeypatch, tmp_path):
+        """Backward compatibility: only the end-frame path changed."""
+        from pathlib import Path
+        from lib.continuity_qa import _extract
+        seen = {}
+
+        def fake_run(cmd, *a, **k):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"\xff\xd8\xff" + b"x" * 64)
+            class R:
+                returncode = 0
+            return R()
+
+        monkeypatch.setattr("lib.continuity_qa.subprocess.run", fake_run)
+        _extract(tmp_path / "in.mp4", tmp_path / "out.jpg", at_end=False)
+        assert "-ss" in seen["cmd"]
+        assert "0.1" in seen["cmd"]
+        assert "-frames:v" in seen["cmd"]

@@ -76,19 +76,34 @@ class ChainResult:
 
 
 def extract_final_frame(video_path: str | Path, out_jpg: str | Path) -> Path:
-    """Grab the last frame of a clip.
+    """Grab the TRUE last decoded frame of a clip.
 
-    Uses ``-sseof`` rather than the frame_sampler tool because frame_sampler
-    addresses frames by absolute timestamp, which would mean probing duration
-    first and would still land short on a clip whose container duration and
-    stream duration disagree — which every H3 clip so far does (5.167s
-    container for a 5s request).
+    Decodes straight through and lets ``-update 1`` overwrite the same output
+    file on every frame, so what survives is the final frame by construction —
+    no seeking, no duration probe, no arithmetic that can land short.
+
+    It must stay that way. The previous implementation seeked with
+    ``-sseof -0.1`` and took one frame, which on a 24fps clip lands on frame
+    n-1 or n-2, not n. On the 2026-09-21 A1 diagnostic that one-frame miss was
+    the difference between a gloved hand 11px above the glass rim and the same
+    hand 379px clear of it; it was read as a generation defect and rerolled at
+    $0.20 before the extractor was found to be the cause. ``frame_sampler`` is
+    still the wrong tool here for the original reason — it addresses frames by
+    absolute timestamp, so it needs a duration probe and still lands short when
+    container and stream durations disagree (every H3 clip: 5.167s container
+    for a 5s request).
+
+    Note ``-frames:v`` must NOT be passed: combined with ``-update`` it would
+    stop after the first frame and pin exactly the wrong end of the clip.
     """
     out = Path(out_jpg)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Full decode, no seek. Acts are 4-8s so this costs milliseconds; if clips
+    # ever get long enough for it to matter, seek to duration-1s first and keep
+    # -update on the remainder.
     subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-y", "-sseof", "-0.1",
-         "-i", str(video_path), "-frames:v", "1", "-q:v", "3", str(out)],
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(video_path),
+         "-an", "-update", "1", "-q:v", "3", str(out)],
         check=True,
     )
     if not out.exists() or out.stat().st_size == 0:

@@ -11,6 +11,9 @@ Run: pytest tests/tools/test_causal_chain.py -v
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 import pytest
 
 from lib.causal_chain import (
@@ -20,6 +23,7 @@ from lib.causal_chain import (
     CausalAct,
     build_chain_payloads,
     estimate_chain_cost,
+    extract_final_frame,
     generate_chain,
 )
 from tools.video.openrouter_video import OpenRouterVideo
@@ -247,3 +251,121 @@ class TestHardening:
         r = OpenRouterVideo().execute({"prompt": "x", "first_frame": "/nope/missing.jpg"})
         assert r.success is False
         assert "invalid generation inputs" in r.error
+
+
+# --------------------------------------------------------------------------
+# Final-frame extraction
+# --------------------------------------------------------------------------
+
+def _ramp_clip(path, n_frames: int = 24, fps: int = 24) -> list[int]:
+    """Encode a clip whose every frame is a flat grey of a distinct value.
+
+    Frame i is grey 10*(i+1), so identifying which frame came back is a single
+    mean(). Near-lossless (qp 0, yuv444p) so the value survives the round trip.
+    Returns the per-frame grey values, last element = the true final frame.
+    """
+    import subprocess as sp
+    from PIL import Image
+
+    src = Path(path).parent / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    values = [10 * (i + 1) for i in range(n_frames)]
+    for i, v in enumerate(values):
+        Image.new("RGB", (160, 288), (v, v, v)).save(src / f"{i:04d}.png")
+    sp.run(["ffmpeg", "-loglevel", "error", "-y", "-framerate", str(fps),
+            "-i", str(src / "%04d.png"), "-c:v", "libx264", "-qp", "0",
+            "-pix_fmt", "yuv444p", str(path)], check=True)
+    return values
+
+
+def _mean_grey(img_path) -> float:
+    import numpy as np
+    from PIL import Image
+    return float(np.asarray(Image.open(img_path).convert("L"), dtype=float).mean())
+
+
+ffmpeg_required = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+)
+
+
+@ffmpeg_required
+class TestFinalFrameExtraction:
+    """The A1 diagnostic on 2026-09-21 handed A2 a frame 0.04s early.
+
+    On that clip the difference was the gloved hand sitting 11px above the rim
+    instead of 379px clear of it — read as a generation defect and rerolled at
+    $0.20 before the extraction was found to be the actual cause. These pin the
+    frame the chain hands off.
+    """
+
+    def test_extracts_the_true_final_frame(self, tmp_path):
+        clip = tmp_path / "ramp.mp4"
+        values = _ramp_clip(clip)
+        out = extract_final_frame(clip, tmp_path / "frames" / "last.jpg")
+        assert out.exists()
+        assert _mean_grey(out) == pytest.approx(values[-1], abs=4)
+
+    def test_does_not_return_the_frame_sseof_would_have_given(self, tmp_path):
+        """Behavioural guard: the old command must disagree with the new one on
+        this fixture, otherwise the fixture proves nothing."""
+        import subprocess as sp
+        clip = tmp_path / "ramp.mp4"
+        values = _ramp_clip(clip)
+
+        old = tmp_path / "old_sseof.jpg"
+        sp.run(["ffmpeg", "-loglevel", "error", "-y", "-sseof", "-0.1",
+                "-i", str(clip), "-frames:v", "1", "-q:v", "3", str(old)], check=True)
+        old_grey = _mean_grey(old)
+
+        new_grey = _mean_grey(extract_final_frame(clip, tmp_path / "new.jpg"))
+        assert old_grey < values[-1] - 5, "fixture does not discriminate; old path already landed last"
+        assert new_grey == pytest.approx(values[-1], abs=4)
+        assert abs(new_grey - old_grey) > 5
+
+    def test_extraction_command_carries_no_seek_flag(self, monkeypatch, tmp_path):
+        """Structural guard so the old behaviour cannot be reintroduced by an
+        edit that still happens to pass the behavioural test on a short clip."""
+        seen = {}
+
+        def fake_run(cmd, *a, **k):
+            seen["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"\xff\xd8\xff" + b"x" * 64)
+            class R:
+                returncode = 0
+            return R()
+
+        monkeypatch.setattr("lib.causal_chain.subprocess.run", fake_run)
+        extract_final_frame(tmp_path / "in.mp4", tmp_path / "out.jpg")
+        cmd = seen["cmd"]
+        assert "-sseof" not in cmd
+        assert "-ss" not in cmd
+        assert "-update" in cmd, "must decode through to the last frame"
+        assert "-frames:v" not in cmd, "-frames:v 1 with -update would pin the FIRST frame"
+
+    def test_empty_output_is_still_an_error(self, monkeypatch, tmp_path):
+        def fake_run(cmd, *a, **k):
+            Path(cmd[-1]).write_bytes(b"")
+            class R:
+                returncode = 0
+            return R()
+
+        monkeypatch.setattr("lib.causal_chain.subprocess.run", fake_run)
+        with pytest.raises(RuntimeError, match="final-frame extraction produced nothing"):
+            extract_final_frame(tmp_path / "in.mp4", tmp_path / "out.jpg")
+
+    def test_chain_hands_the_true_final_frame_to_the_next_act(self, tmp_path):
+        """End to end through generate_chain with the real extractor: act 2's
+        first_frame must be act 1's last frame, not a frame near its end."""
+        values = None
+
+        def executor(payload):
+            nonlocal values
+            values = _ramp_clip(Path(payload["output_path"]))
+            return FakeResult()
+
+        res = generate_chain(ACTS[:2], tmp_path, dry_run=False, executor=executor)
+        assert res.ok
+        handoff = tmp_path / "frames" / "A1_last.jpg"
+        assert handoff.exists()
+        assert _mean_grey(handoff) == pytest.approx(values[-1], abs=4)

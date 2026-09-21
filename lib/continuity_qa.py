@@ -113,10 +113,24 @@ def probe_clip(path: str | Path) -> ClipFacts:
 
 
 def _extract(video: str | Path, out: Path, *, at_end: bool, width: int = 220) -> Path:
+    """Stage one boundary frame as evidence.
+
+    The end frame is taken the same way :func:`lib.causal_chain.extract_final_frame`
+    takes it — decode through with ``-update 1``, no seek — because this pane is
+    the evidence for what the chain handed forward. Sampling it 0.1s earlier than
+    the frame actually used made the evidence disagree with the run, which is
+    worse than having no evidence at all.
+
+    The start frame stays at ``-ss 0.1``: the first decoded frame of a generated
+    clip is sometimes a lead-in that misrepresents the opening state.
+    """
     out.parent.mkdir(parents=True, exist_ok=True)
-    pre = ["-sseof", "-0.1"] if at_end else ["-ss", "0.1"]
-    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", *pre, "-i", str(video),
-                    "-frames:v", "1", "-vf", f"scale={width}:-1", str(out)], check=True)
+    scale = ["-vf", f"scale={width}:-1"]
+    cmd = (["ffmpeg", "-loglevel", "error", "-y", "-i", str(video), "-an", "-update", "1", *scale]
+           if at_end else
+           ["ffmpeg", "-loglevel", "error", "-y", "-ss", "0.1", "-i", str(video),
+            "-frames:v", "1", *scale])
+    subprocess.run([*cmd, str(out)], check=True)
     return out
 
 
